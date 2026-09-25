@@ -12,6 +12,7 @@ import { AssessmentsModule } from './assessments/assessments.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { FeesModule } from './fees/fees.module';
+import { OpenApiController } from './openapi.controller';
 
 @Module({
   imports: [
@@ -33,5 +34,6 @@ import { FeesModule } from './fees/fees.module';
     NotificationsModule,
     FeesModule,
   ],
+  controllers: [OpenApiController],
 })
 export class AppModule {}

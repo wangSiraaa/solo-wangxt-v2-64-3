@@ -8,7 +8,15 @@ import { ReviewDecision } from '../entities/review-decision.entity';
 import { NotificationRecord } from '../entities/notification.entity';
 import { GradeEffectivePeriod } from '../entities/grade-period.entity';
 import { FeeRateVersion } from '../entities/fee-rate-version.entity';
+import { LeaveEvent } from '../entities/leave-event.entity';
+import { LeavePeriod } from '../entities/leave-period.entity';
+import { LeaveAnomaly } from '../entities/leave-anomaly.entity';
+import { FeeSettlement } from '../entities/fee-settlement.entity';
+import { FeeChargeEntry } from '../entities/fee-charge-entry.entity';
+import { FeeAdjustment } from '../entities/fee-adjustment.entity';
+import { FeeAdjustmentItem } from '../entities/fee-adjustment-item.entity';
 import { seedDemoData } from './seed';
+import { migrateLeaveLedger } from './migrate-leave-ledger';
 
 export const entities = [
   ScaleVersion,
@@ -20,6 +28,13 @@ export const entities = [
   NotificationRecord,
   GradeEffectivePeriod,
   FeeRateVersion,
+  LeaveEvent,
+  LeavePeriod,
+  LeaveAnomaly,
+  FeeSettlement,
+  FeeChargeEntry,
+  FeeAdjustment,
+  FeeAdjustmentItem,
 ];
 
 export function buildDataSourceOptions(): DataSourceOptions {
@@ -63,6 +78,8 @@ export async function ensureSchema(dataSource: DataSource): Promise<void> {
         )
     `);
   }
+
+  await migrateLeaveLedger(dataSource);
 }
 
 let singleton: Promise<DataSource> | null = null;

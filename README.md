@@ -17,7 +17,9 @@ NestJS + PostgreSQL + TypeORM + decimal.js 的服务端流程。**无前端**。
 6. **费用生效按机构示例规则独立判断**：等级是否已确认才是生效前提，与家属告知是否送达无关。
 7. **同一天不能出现重叠生效等级**：服务层显式校验 + PostgreSQL `btree_gist` 的 daterange 排他约束双保险。月中换级时旧期间自动截至生效日前一日（半开区间首尾相接）。
 8. **费用按天分段**：等级期间 × 日费版本切换日二次切分，闭区间逐天连续（含无生效等级空洞段），天数守恒校验；金额一律 decimal.js 计算，两位小数 `ROUND_HALF_UP`。
-9. **接口可解释**：评估响应内嵌两位评估员逐项明细（原始选项、分值、是否计入分母、NA 说明、原始分/有效分母/百分比/定级阈值）；费用分段逐段给出等级、日费版本、天数、金额与来源。
+9. **离返院事件账本与暂停费用**：`leave_events` 仅追加保存稳定事件号、发生时间、接收顺序和原始回调；系统按完整事件历史重放物化 `leave_periods`。重复事件幂等；返院先到、离院后补也能归并出唯一区间；缺配对、返院早于离院、重叠离院均给出状态/异常，绝不按整月停费。
+10. **已结算费用只追加调整**：结算逐日落原始账，迟到离返院事件命中已结算日期时不覆盖原账，只生成 `REFUND/SURCHARGE` 调整单及逐日来源。暂停可跨等级和费率版本，仍保留原有分段，只对命中日暂停。
+11. **接口可解释**：评估响应内嵌两位评估员逐项明细（原始选项、分值、是否计入分母、NA 说明、原始分/有效分母/百分比/定级阈值）；费用分段逐段给出等级、日费版本、天数、金额、暂停区间与来源；OpenAPI：`GET /api/openapi.json`。
 
 ## 演示数据
 
@@ -48,7 +50,15 @@ npm test              # e2e（自带嵌入式 PG，覆盖下列全部场景）
 | POST | `/assessments/:id/notification/attempt` | 家属告知尝试（`{"simulateFail":true}` 模拟通道失败） |
 | GET | `/assessments/:id/notification` | 全部告知记录（失败历史、未确认尝试均保留） |
 | POST | `/fees/activate` | 等级生效 `{caseId, effectiveDate}` |
-| GET | `/fees/segments?elderId=&from=&to=` | 按天分段费用与 decimal 合计 |
+| GET | `/fees/segments?elderId=&from=&to=` | 在院等级×费率基线分段与 decimal 合计（不应用离院暂停） |
+| POST | `/fees/leave-events` | 批量录入离院/返院事件，原子归并暂停区间 |
+| GET | `/fees/leave-events?elderId=` | 查询不可变事件账本 |
+| GET | `/fees/leave-periods?elderId=` | 查询物化区间、缺配对/时间倒挂/重叠等可解释状态 |
+| GET | `/fees/leave/trial?elderId=&from=&to=` | 离院感知试算：逐日命中暂停，保留等级和费率分段 |
+| POST | `/fees/settlements` | 逐日落账结算（支持 `idempotencyKey`） |
+| GET | `/fees/settlements?elderId=` / `/fees/settlements/:id` | 查询结算单、原始逐日账目和调整来源 |
+| GET | `/fees/adjustments?elderId=&settlementId=` | 查询迟到事件生成的补收/退费调整单 |
+| GET | `/openapi.json` | OpenAPI 3 文档 |
 
 ### 示例：月中升级 + 闰月
 
@@ -73,4 +83,9 @@ curl -s 'localhost:3000/api/fees/segments?elderId=E1&from=2024-02-01&to=2024-02-
 - 重复确认请求：相同幂等键回放、无键重复 409；
 - 尚未确认尝试告知 → `UNCONFIRMED/FAILED`；送达失败原因分行留痕；
 - 月中升级切旧区间、同案重复生效回放、同日不同等级重叠 409；
-- 闰月 2024-02（29 天）分段金额、跨 2024-01-01 调价日同等级二次分段、无等级空洞段、非法闰日期拒绝。
+- 闰月 2024-02（29 天）分段金额、跨 2024-01-01 调价日同等级二次分段、无等级空洞段、非法闰日期拒绝；
+- 月中离返院仅命中日暂停，暂停跨等级/费率版本时保留分段；
+- 重复离返院回调不重复减费；先收到返院再补离院仍物化唯一区间；
+- 缺少配对、返院早于离院等状态不产生整月停费；
+- 迟到事件命中已结算月份时原始账目不变，仅追加唯一退费/补收调整及逐日来源；
+- 并发补录冲突整批回滚无半区间；重启后事件、区间、原账和调整来源均可回放。

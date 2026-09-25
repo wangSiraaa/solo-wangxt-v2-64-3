@@ -28,3 +28,4 @@ __pycache__/
 dist/
 .pg-data/
 .pg-test-data/
+.pg-test-data-*/
