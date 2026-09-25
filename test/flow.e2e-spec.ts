@@ -80,8 +80,11 @@ describe('养老评估-复核-告知-费用 全流程 (e2e)', () => {
     // 清空业务表（保留量表与日费规则种子）
     const ds = app.get(DataSource);
     await ds.query(`
-      TRUNCATE grade_periods, notification_records, review_decisions,
-               assessor_answers, assessment_cases RESTART IDENTITY CASCADE
+      TRUNCATE fee_adjustment_lines, fee_adjustments, fee_settlement_lines,
+               fee_settlements, leave_suspension_periods, leave_events,
+               leave_event_batches, grade_periods, notification_records,
+               review_decisions, assessor_answers, assessment_cases
+      RESTART IDENTITY CASCADE
     `);
   }, 120_000);
 
@@ -571,5 +574,433 @@ describe('养老评估-复核-告知-费用 全流程 (e2e)', () => {
       .query({ elderId: 'E-FEE', from: '2023-02-01', to: '2023-02-29' })
       .expect(409);
     expect(JSON.stringify(res.body)).toMatch(/不合法|INVALID/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // 离返院事件账本：幂等、乱序、暂停分段、结算后调整、并发和重启回放
+  // ---------------------------------------------------------------------------
+  async function activateGradePeriod(
+    elderId: string,
+    gradeOverride: Record<string, string> = {},
+    effectiveDate = '2024-02-01',
+    confirmed?: GradeCode,
+  ): Promise<string> {
+    const c = await http
+      .post('/api/assessments')
+      .send(payload(elderId, answers(gradeOverride ?? {}), answers(gradeOverride ?? {})))
+      .expect(201);
+    let caseId = c.body.id;
+    if (c.body.status === 'PENDING_REVIEW') {
+      await http
+        .post(`/api/assessments/${caseId}/review/confirm`)
+        .send({
+          confirmedGrade: confirmed ?? GradeCode.SEVERE,
+          reviewerId: 'leave-mgr',
+          comment: '离返院费用测试确认等级',
+        })
+        .expect(201);
+    }
+    await http
+      .post('/api/fees/activate')
+      .send({ caseId, effectiveDate })
+      .expect(201);
+    return caseId;
+  }
+
+  it('离返院：月中离院/返院只暂停命中日，跨等级和费率版本仍保留分段解释', async () => {
+    await activateGradePeriod('E-LEAVE-CROSS', {}, '2024-02-01');
+    const severe: Record<string, string> = {};
+    for (const c of ITEMS_8) severe[c] = OPT.TOTAL_DEP;
+    await activateGradePeriod('E-LEAVE-CROSS', severe, '2024-02-20', GradeCode.SEVERE);
+
+    await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-CROSS',
+        batchNo: 'cross-leave',
+        events: [
+          {
+            eventNo: 'evt-cross-leave',
+            eventType: 'LEAVE',
+            occurredAt: '2024-02-10T10:00:00+08:00',
+            receiveSequence: 1,
+          },
+        ],
+      })
+      .expect(201);
+    await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-CROSS',
+        batchNo: 'cross-return',
+        events: [
+          {
+            eventNo: 'evt-cross-return',
+            eventType: 'RETURN',
+            occurredAt: '2024-02-25T18:00:00+08:00',
+            receiveSequence: 2,
+          },
+        ],
+      })
+      .expect(201);
+
+    const res = await http
+      .get('/api/fees/segments')
+      .query({ elderId: 'E-LEAVE-CROSS', from: '2024-02-01', to: '2024-02-29' })
+      .expect(200);
+
+    expect(res.body.totalDays).toBe(29);
+    expect(res.body.pausedDays).toBe(16); // 2/10~2/25 含首尾
+    expect(res.body.originalAmount).toBe('4900.00'); // 19*100 + 10*300
+    expect(res.body.totalAmount).toBe('2100.00'); // 9*100 + 4*300
+    expect(res.body.segments.map((s: any) => s.startDate)).toEqual([
+      '2024-02-01',
+      '2024-02-10',
+      '2024-02-20',
+      '2024-02-26',
+    ]);
+    const lightPaid = res.body.segments[0];
+    const pausedLight = res.body.segments[1];
+    const pausedSevere = res.body.segments[2];
+    const severePaid = res.body.segments[3];
+    expect(lightPaid).toMatchObject({ grade: GradeCode.LIGHT, days: 9, amount: '900.00' });
+    expect(pausedLight).toMatchObject({ status: 'PAUSED_MATCHED', grade: GradeCode.LIGHT, days: 10, amount: '0.00', originalAmount: '1000.00' });
+    expect(pausedSevere).toMatchObject({ status: 'PAUSED_MATCHED', grade: GradeCode.SEVERE, days: 6, amount: '0.00', originalAmount: '1800.00' });
+    expect(severePaid).toMatchObject({ grade: GradeCode.SEVERE, days: 4, amount: '1200.00' });
+    expect(JSON.stringify(pausedLight.warnings.concat(pausedSevere.warnings))).toContain('跨等级');
+
+    const periods = await http
+      .get('/api/leave-periods')
+      .query({ elderId: 'E-LEAVE-CROSS' })
+      .expect(200);
+    expect(periods.body).toHaveLength(1);
+    expect(periods.body[0]).toMatchObject({
+      status: 'MATCHED',
+      startDate: '2024-02-10',
+      endDate: '2024-02-25',
+    });
+  });
+
+  it('离返院：跨日费版本时暂停日仍按版本切分，给出跨版本解释', async () => {
+    const moderate: Record<string, string> = {};
+    for (const c of ITEMS_8) moderate[c] = OPT.MUCH_HELP;
+    await activateGradePeriod('E-LEAVE-RATE', moderate, '2023-12-28', GradeCode.MODERATE);
+
+    await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-RATE',
+        batchNo: 'rate-cross',
+        events: [
+          { eventNo: 'rate-leave', eventType: 'LEAVE', occurredAt: '2023-12-31T08:00:00+08:00', receiveSequence: 50 },
+          { eventNo: 'rate-return', eventType: 'RETURN', occurredAt: '2024-01-02T18:00:00+08:00', receiveSequence: 51 },
+        ],
+      })
+      .expect(201);
+
+    const res = await http
+      .get('/api/fees/segments')
+      .query({ elderId: 'E-LEAVE-RATE', from: '2023-12-28', to: '2024-01-05' })
+      .expect(200);
+
+    expect(res.body.pausedDays).toBe(3);
+    expect(res.body.originalAmount).toBe('1720.00');
+    expect(res.body.totalAmount).toBe('1140.00');
+    expect(res.body.segments.map((s: any) => s.status)).toEqual([
+      'BILLABLE',
+      'PAUSED_MATCHED',
+      'PAUSED_MATCHED',
+      'BILLABLE',
+    ]);
+    expect(res.body.segments[1]).toMatchObject({
+      days: 1,
+      rateEffectiveFrom: '2000-01-01',
+      dailyRate: '180.00',
+      amount: '0.00',
+      originalAmount: '180.00',
+    });
+    expect(res.body.segments[2]).toMatchObject({
+      days: 2,
+      rateEffectiveFrom: '2024-01-01',
+      dailyRate: '200.00',
+      amount: '0.00',
+      originalAmount: '400.00',
+    });
+    expect(JSON.stringify(res.body.segments.map((s: any) => s.warnings))).toContain('跨日费版本');
+  });
+
+  it('离返院：缺少配对和返院早于离院均给可解释状态，不能整月停费', async () => {
+    await activateGradePeriod('E-LEAVE-BAD', {}, '2024-07-01');
+    await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-BAD',
+        batchNo: 'bad-return',
+        events: [
+          { eventNo: 'true-early-return', eventType: 'RETURN', occurredAt: '2024-07-03T08:00:00+08:00', receiveSequence: 60 },
+          { eventNo: 'late-leave-after-return', eventType: 'LEAVE', occurredAt: '2024-07-05T08:00:00+08:00', receiveSequence: 61 },
+        ],
+      })
+      .expect(201);
+
+    const periods = await http
+      .get('/api/leave-periods')
+      .query({ elderId: 'E-LEAVE-BAD' })
+      .expect(200);
+    const statuses = periods.body.map((p: any) => p.status).sort();
+    expect(statuses).toEqual(['OPEN_MISSING_RETURN', 'RETURN_BEFORE_DEPARTURE']);
+
+    const fees = await http
+      .get('/api/fees/segments')
+      .query({ elderId: 'E-LEAVE-BAD', from: '2024-07-01', to: '2024-07-10' })
+      .expect(200);
+    // 返院早于离院不产生暂停；缺少配对的离院从 7/5 起逐日临时暂停，而非整月 0 元
+    expect(fees.body.pausedDays).toBe(6);
+    expect(fees.body.totalAmount).toBe('400.00');
+    expect(fees.body.anomalies.map((a: any) => a.status)).toContain('RETURN_BEFORE_DEPARTURE');
+
+    await http
+      .post('/api/fees/settle')
+      .send({ elderId: 'E-LEAVE-BAD', month: '2024-07' })
+      .expect(409)
+      .expect((r) => expect(JSON.stringify(r.body)).toContain('MONTH_NOT_SETTLEABLE'));
+  });
+
+  it('离返院：重复回调按稳定事件号幂等，不重复减费', async () => {
+    await activateGradePeriod('E-LEAVE-IDEM', {}, '2024-03-01');
+    const body = {
+      elderId: 'E-LEAVE-IDEM',
+      batchNo: 'idem-batch',
+      events: [
+        { eventNo: 'evt-idem-leave', eventType: 'LEAVE', occurredAt: '2024-03-05T08:00:00+08:00', receiveSequence: 10 },
+        { eventNo: 'evt-idem-return', eventType: 'RETURN', occurredAt: '2024-03-06T20:00:00+08:00', receiveSequence: 11 },
+      ],
+    };
+    const first = await http.post('/api/leave-events').send(body).expect(201);
+    const second = await http.post('/api/leave-events').send(body).expect(201);
+    expect(first.body.replayed).toBe(false);
+    expect(second.body.replayed).toBe(true);
+
+    const ledger = await http
+      .get('/api/elders/E-LEAVE-IDEM/leave-events')
+      .expect(200);
+    expect(ledger.body.events).toHaveLength(2);
+    expect(ledger.body.periods).toHaveLength(1);
+
+    const fees = await http
+      .get('/api/fees/segments')
+      .query({ elderId: 'E-LEAVE-IDEM', from: '2024-03-01', to: '2024-03-10' })
+      .expect(200);
+    expect(fees.body.pausedDays).toBe(2);
+    expect(fees.body.totalAmount).toBe('800.00');
+
+    // 绕过 batchNo 的重复稳定事件号也必须整批拒绝
+    await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-IDEM',
+        batchNo: 'different-batch',
+        events: [body.events[0]],
+      })
+      .expect(409)
+      .expect((r) => expect(JSON.stringify(r.body)).toContain('DUPLICATE_EVENT_NO'));
+  });
+
+  it('离返院：先收到返院，再补离院，重放后得到唯一正确区间', async () => {
+    await activateGradePeriod('E-LEAVE-ORDER', {}, '2024-04-01');
+    const ret = await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-ORDER',
+        batchNo: 'return-first',
+        events: [
+          { eventNo: 'evt-ordered-return', eventType: 'RETURN', occurredAt: '2024-04-12T09:00:00+08:00', receiveSequence: 20 },
+        ],
+      })
+      .expect(201);
+    expect(ret.body.periods[0].status).toBe('ORPHAN_RETURN');
+    expect(ret.body.periods[0].explanation).toContain('缺少可配对离院事件');
+
+    await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-ORDER',
+        batchNo: 'leave-later',
+        events: [
+          { eventNo: 'evt-ordered-leave', eventType: 'LEAVE', occurredAt: '2024-04-10T08:00:00+08:00', receiveSequence: 21 },
+        ],
+      })
+      .expect(201);
+
+    const periods = await http
+      .get('/api/leave-periods')
+      .query({ elderId: 'E-LEAVE-ORDER' })
+      .expect(200);
+    expect(periods.body).toHaveLength(1);
+    expect(periods.body[0]).toMatchObject({
+      status: 'MATCHED',
+      startDate: '2024-04-10',
+      endDate: '2024-04-12',
+      leaveEventNo: 'evt-ordered-leave',
+      returnEventNo: 'evt-ordered-return',
+    });
+
+    const fees = await http
+      .get('/api/fees/segments')
+      .query({ elderId: 'E-LEAVE-ORDER', from: '2024-04-01', to: '2024-04-12' })
+      .expect(200);
+    expect(fees.body.pausedDays).toBe(3);
+    expect(fees.body.totalAmount).toBe('900.00');
+  });
+
+  it('离返院：迟到事件命中已结算月份时不改原账，只追加唯一退费调整单', async () => {
+    await activateGradePeriod('E-LEAVE-LATE', {}, '2024-05-01');
+    const before = await http
+      .post('/api/fees/settle')
+      .send({ elderId: 'E-LEAVE-LATE', month: '2024-05' })
+      .expect(201);
+    expect(before.body.replayed).toBe(false);
+    expect(before.body.settlement.originalAmount).toBe('3100.00');
+    expect(before.body.settlement.billedAmount).toBe('3100.00');
+
+    await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-LATE',
+        batchNo: 'late-matched',
+        events: [
+          { eventNo: 'late-leave', eventType: 'LEAVE', occurredAt: '2024-05-10T08:00:00+08:00', receiveSequence: 30 },
+          { eventNo: 'late-return', eventType: 'RETURN', occurredAt: '2024-05-12T18:00:00+08:00', receiveSequence: 31 },
+        ],
+      })
+      .expect(201)
+      .expect((r) => {
+        expect(r.body.adjustments).toHaveLength(1);
+        expect(r.body.adjustments[0]).toMatchObject({
+          adjustmentType: 'REFUND',
+          amount: '-300.00',
+        });
+        expect(r.body.adjustments[0].lines).toHaveLength(3);
+      });
+
+    const settled = await http
+      .get('/api/fees/settlements/2024-05')
+      .query({ elderId: 'E-LEAVE-LATE' })
+      .expect(200);
+    expect(settled.body.settlement.billedAmount).toBe('3100.00');
+    expect(settled.body.currentNetAmount).toBe('2800.00');
+    expect(settled.body.adjustments[0].lines.map((l: any) => l.feeDate)).toEqual([
+      '2024-05-10',
+      '2024-05-11',
+      '2024-05-12',
+    ]);
+
+    // 同一事件批次/回调重放不重复生成调整；重复 settlement 也幂等回放
+    const replayEvents = await http
+      .post('/api/leave-events')
+      .send({
+        elderId: 'E-LEAVE-LATE',
+        batchNo: 'late-matched',
+        events: [
+          { eventNo: 'late-leave', eventType: 'LEAVE', occurredAt: '2024-05-10T08:00:00+08:00', receiveSequence: 30 },
+          { eventNo: 'late-return', eventType: 'RETURN', occurredAt: '2024-05-12T18:00:00+08:00', receiveSequence: 31 },
+        ],
+      })
+      .expect(201);
+    expect(replayEvents.body.replayed).toBe(true);
+    const replaySettle = await http
+      .post('/api/fees/settle')
+      .send({ elderId: 'E-LEAVE-LATE', month: '2024-05' })
+      .expect(201);
+    expect(replaySettle.body.replayed).toBe(true);
+    const afterReplay = await http
+      .get('/api/fees/adjustments')
+      .query({ elderId: 'E-LEAVE-LATE', month: '2024-05' })
+      .expect(200);
+    expect(afterReplay.body).toHaveLength(1);
+  });
+
+  it('离返院：并发补录接收顺序冲突时整批失败，重启后事件/区间/原账/调整均可回放', async () => {
+    await activateGradePeriod('E-LEAVE-RESTART', {}, '2024-06-01');
+    await http
+      .post('/api/fees/settle')
+      .send({ elderId: 'E-LEAVE-RESTART', month: '2024-06' })
+      .expect(201);
+
+    const [ok, conflict] = await Promise.all([
+      http.post('/api/leave-events').send({
+        elderId: 'E-LEAVE-RESTART',
+        batchNo: 'concurrent-ok',
+        events: [
+          { eventNo: 'restart-leave', eventType: 'LEAVE', occurredAt: '2024-06-08T08:00:00+08:00', receiveSequence: 40 },
+          { eventNo: 'restart-return', eventType: 'RETURN', occurredAt: '2024-06-09T20:00:00+08:00', receiveSequence: 41 },
+        ],
+      }),
+      http.post('/api/leave-events').send({
+        elderId: 'E-LEAVE-RESTART',
+        batchNo: 'concurrent-bad',
+        events: [
+          { eventNo: 'conflicting-return', eventType: 'RETURN', occurredAt: '2024-06-20T20:00:00+08:00', receiveSequence: 41 },
+        ],
+      }),
+    ]);
+
+    const statuses = [ok.status, conflict.status].sort();
+    expect(statuses).toEqual([201, 409]);
+    if (ok.status === 409) throw new Error('接受成功批次意外失败：' + JSON.stringify(ok.body));
+    expect(ok.body.adjustments).toHaveLength(1);
+    expect(ok.body.adjustments[0].amount).toBe('-200.00');
+
+    const ds = app.get(DataSource);
+    const counts = await ds.query(
+      `SELECT
+        (SELECT count(*) FROM leave_events WHERE elder_id='E-LEAVE-RESTART')::text AS events,
+        (SELECT count(*) FROM leave_event_batches WHERE elder_id='E-LEAVE-RESTART')::text AS batches,
+        (SELECT count(*) FROM leave_suspension_periods WHERE elder_id='E-LEAVE-RESTART')::text AS periods,
+        (SELECT count(*) FROM fee_adjustments WHERE elder_id='E-LEAVE-RESTART')::text AS adjustments`,
+    );
+    expect(counts[0]).toMatchObject({ events: '2', batches: '1', periods: '1', adjustments: '1' });
+
+    // 模拟应用重启：重新创建 NestApplication；启动钩子会从事件历史重建暂停区间。
+    await app.close();
+    const moduleRef2 = await Test.createTestingModule({ imports: [AppModule] }).compile();
+    app = moduleRef2.createNestApplication();
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+    app.setGlobalPrefix('api');
+    await app.init();
+    http = request(app.getHttpServer());
+
+    const replayedLedger = await http
+      .get('/api/elders/E-LEAVE-RESTART/leave-events')
+      .expect(200);
+    expect(replayedLedger.body.events).toHaveLength(2);
+    expect(replayedLedger.body.periods).toHaveLength(1);
+    expect(replayedLedger.body.periods[0]).toMatchObject({
+      status: 'MATCHED',
+      startDate: '2024-06-08',
+      endDateExclusive: '2024-06-10',
+    });
+    const replayedSettlement = await http
+      .get('/api/fees/settlements/2024-06')
+      .query({ elderId: 'E-LEAVE-RESTART' })
+      .expect(200);
+    expect(replayedSettlement.body.settlement.billedAmount).toBe('3000.00');
+    expect(replayedSettlement.body.currentNetAmount).toBe('2800.00');
+    expect(replayedSettlement.body.adjustments).toHaveLength(1);
+    expect(replayedSettlement.body.adjustments[0].lines[0].batchId).toBeTruthy();
+    expect(replayedSettlement.body.adjustments[0].lines[0].settlementLineId).toBeTruthy();
+  });
+
+  it('OpenAPI：离返院事件、暂停、试算、结算和调整接口可发现', async () => {
+    const doc = await http.get('/api/openapi').expect(200);
+    for (const path of [
+      '/leave-events',
+      '/leave-periods',
+      '/fees/leave-trial',
+      '/fees/settle',
+      '/fees/adjustments',
+    ]) {
+      expect(doc.body.paths[path]).toBeTruthy();
+    }
   });
 });

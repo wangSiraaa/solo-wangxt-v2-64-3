@@ -8,6 +8,14 @@ import { ReviewDecision } from '../entities/review-decision.entity';
 import { NotificationRecord } from '../entities/notification.entity';
 import { GradeEffectivePeriod } from '../entities/grade-period.entity';
 import { FeeRateVersion } from '../entities/fee-rate-version.entity';
+import { LeaveEventBatch } from '../entities/leave-event-batch.entity';
+import { LeaveEvent } from '../entities/leave-event.entity';
+import { LeaveSuspensionPeriod } from '../entities/leave-suspension-period.entity';
+import { FeeSettlement } from '../entities/fee-settlement.entity';
+import { FeeSettlementLine } from '../entities/fee-settlement-line.entity';
+import { FeeAdjustment } from '../entities/fee-adjustment.entity';
+import { FeeAdjustmentLine } from '../entities/fee-adjustment-line.entity';
+import { migrateLeaveLedger } from './migrations/1700000000000-LeaveLedger';
 import { seedDemoData } from './seed';
 
 export const entities = [
@@ -20,6 +28,13 @@ export const entities = [
   NotificationRecord,
   GradeEffectivePeriod,
   FeeRateVersion,
+  LeaveEventBatch,
+  LeaveEvent,
+  LeaveSuspensionPeriod,
+  FeeSettlement,
+  FeeSettlementLine,
+  FeeAdjustment,
+  FeeAdjustmentLine,
 ];
 
 export function buildDataSourceOptions(): DataSourceOptions {
@@ -49,6 +64,7 @@ export async function ensureSchema(dataSource: DataSource): Promise<void> {
   if (!exists[0].ok) {
     await dataSource.synchronize();
   }
+  await migrateLeaveLedger(dataSource);
 
   const constraint = await dataSource.query(
     `SELECT 1 FROM pg_constraint WHERE conname = 'grade_periods_no_overlap'`,

@@ -5,9 +5,11 @@ import { GradeEffectivePeriod } from '../entities/grade-period.entity';
 import { FeeRateVersion } from '../entities/fee-rate-version.entity';
 import { FeesController } from './fees.controller';
 import { FeesService } from './fees.service';
+import { BillingModule } from '../billing/billing.module';
 
 @Module({
   imports: [
+    BillingModule,
     TypeOrmModule.forFeature([
       AssessmentCase,
       GradeEffectivePeriod,

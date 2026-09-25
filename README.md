@@ -17,7 +17,11 @@ NestJS + PostgreSQL + TypeORM + decimal.js 的服务端流程。**无前端**。
 6. **费用生效按机构示例规则独立判断**：等级是否已确认才是生效前提，与家属告知是否送达无关。
 7. **同一天不能出现重叠生效等级**：服务层显式校验 + PostgreSQL `btree_gist` 的 daterange 排他约束双保险。月中换级时旧期间自动截至生效日前一日（半开区间首尾相接）。
 8. **费用按天分段**：等级期间 × 日费版本切换日二次切分，闭区间逐天连续（含无生效等级空洞段），天数守恒校验；金额一律 decimal.js 计算，两位小数 `ROUND_HALF_UP`。
-9. **接口可解释**：评估响应内嵌两位评估员逐项明细（原始选项、分值、是否计入分母、NA 说明、原始分/有效分母/百分比/定级阈值）；费用分段逐段给出等级、日费版本、天数、金额与来源。
+9. **离返院事件溯源**：`leave_events` 只追加，外部稳定事件号幂等，保存实际发生时间、接收顺序和 LEAVE/RETURN 类型；系统按“发生时间 + 接收顺序”从事件历史重建不重叠暂停区间，包含离院日与返院日。
+10. **暂停不按整月推断**：缺返院、返院早于离院、嵌套离院均有独立解释状态；试算只逐日临时暂停，跨等级/费率版本时仍保留原有等级与费率分段并给出 warning，月结遇到未解释异常会阻断。
+11. **已结算账不可覆盖**：月结冻结逐日原费用与暂停后应收。迟到事件只对未结算试算生效；命中已结算月份时只追加逐行来源完整的补收/退费调整单，原结算头和原费用行永不更新。
+12. **整批原子与可回放**：补录批次整事务提交，稳定事件号/老人内接收顺序冲突整批 409；同一老人使用事务咨询锁串行化。重启后从事件账本重建暂停区间，原账与调整来源仍可追溯。
+13. **接口可解释**：评估响应内嵌两位评估员逐项明细（原始选项、分值、是否计入分母、NA 说明、原始分/有效分母/百分比/定级阈值）；费用分段逐段给出等级、日费版本、天数、金额、暂停区间与来源。
 
 ## 演示数据
 
@@ -48,7 +52,39 @@ npm test              # e2e（自带嵌入式 PG，覆盖下列全部场景）
 | POST | `/assessments/:id/notification/attempt` | 家属告知尝试（`{"simulateFail":true}` 模拟通道失败） |
 | GET | `/assessments/:id/notification` | 全部告知记录（失败历史、未确认尝试均保留） |
 | POST | `/fees/activate` | 等级生效 `{caseId, effectiveDate}` |
-| GET | `/fees/segments?elderId=&from=&to=` | 按天分段费用与 decimal 合计 |
+| GET | `/fees/segments?elderId=&from=&to=` | 按天分段费用、离院暂停、异常解释与 decimal 合计 |
+| POST | `/leave-events` | 整批录入/补录离返院事件；`batchNo` 幂等，冲突整批失败 |
+| GET | `/elders/:elderId/leave-events` | 回放事件账本、物化暂停区间和异常 |
+| GET | `/leave-periods?elderId=&status=` | 查询不重叠暂停区间及 MATCHED/OPEN/异常解释 |
+| GET | `/fees/leave-trial?elderId=&from=&to=` | 逐日费用试算（未配对离院仅临时暂停，不整月停费） |
+| POST | `/fees/settle` | 月结 `{elderId,month:"YYYY-MM"}`，冻结原费用和应收 |
+| GET | `/fees/settlements/:month?elderId=` | 查询已结算原账、追加调整和当前净额 |
+| GET | `/fees/adjustments?elderId=&month=` | 查询迟到事件产生的补收/退费调整及逐日来源 |
+| GET | `/openapi` | OpenAPI 3 文档 |
+
+### 示例：迟到离返院事件与已结算调整
+
+```bash
+curl -sXPOST localhost:3000/api/fees/settle -H 'Content-Type: application/json' \
+  -d '{"elderId":"E1","month":"2024-02"}'
+
+# 月结后补录：2/10 离院、2/12 返院（含首尾，共暂停 3 天）
+curl -sXPOST localhost:3000/api/leave-events -H 'Content-Type: application/json' -d '{
+  "elderId":"E1",
+  "batchNo":"leave-202402-001",
+  "events":[
+    {"eventNo":"leave-202402-001","eventType":"LEAVE",
+     "occurredAt":"2024-02-10T10:00:00+08:00","receiveSequence":101},
+    {"eventNo":"return-202402-001","eventType":"RETURN",
+     "occurredAt":"2024-02-12T18:00:00+08:00","receiveSequence":102}
+  ]}'
+# 原 settlement.billedAmount 不变；fee_adjustments 追加 amount=-3*日费 的 REFUND，
+# fee_adjustment_lines 逐天连接 settlement_line_id、batch_id 和新的暂停区间键。
+```
+
+暂停状态：`MATCHED`（已配对）、`OPEN_MISSING_RETURN`（缺返院，试算临时暂停、月结阻断）、
+`ORPHAN_RETURN`（无离院的返院）、`RETURN_BEFORE_DEPARTURE`（返院早于离院）、
+`NESTED_DEPARTURE`（嵌套离院需人工核对）。
 
 ### 示例：月中升级 + 闰月
 
@@ -73,4 +109,8 @@ curl -s 'localhost:3000/api/fees/segments?elderId=E1&from=2024-02-01&to=2024-02-
 - 重复确认请求：相同幂等键回放、无键重复 409；
 - 尚未确认尝试告知 → `UNCONFIRMED/FAILED`；送达失败原因分行留痕；
 - 月中升级切旧区间、同案重复生效回放、同日不同等级重叠 409；
-- 闰月 2024-02（29 天）分段金额、跨 2024-01-01 调价日同等级二次分段、无等级空洞段、非法闰日期拒绝。
+- 闰月 2024-02（29 天）分段金额、跨 2024-01-01 调价日同等级二次分段、无等级空洞段、非法闰日期拒绝；
+- 月中离/返院只暂停命中日且跨等级/跨费率保留分段；重复稳定事件幂等；返院先到、离院后补后重放出唯一配对区间；
+- 缺配对、返院早于离院、嵌套离院返回可解释状态并阻断不明月结；
+- 迟到事件命中已结算月份时原账不变，仅追加逐天来源完整的补收/退费调整；重复批次/结算回放不重复调整；
+- 并发补录冲突整批失败无半区间；应用重启后事件账本、暂停区间、原费用和调整来源均可回放。

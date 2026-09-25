@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, OnModuleInit } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import {
@@ -12,6 +12,10 @@ import { AssessmentsModule } from './assessments/assessments.module';
 import { ReviewsModule } from './reviews/reviews.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { FeesModule } from './fees/fees.module';
+import { BillingModule } from './billing/billing.module';
+import { LeavesModule } from './leaves/leaves.module';
+import { OpenApiModule } from './openapi/openapi.module';
+import { LeavesService } from './leaves/leaves.service';
 
 @Module({
   imports: [
@@ -32,6 +36,16 @@ import { FeesModule } from './fees/fees.module';
     ReviewsModule,
     NotificationsModule,
     FeesModule,
+    BillingModule,
+    LeavesModule,
+    OpenApiModule,
   ],
 })
-export class AppModule {}
+export class AppModule implements OnModuleInit {
+  constructor(private readonly leavesService: LeavesService) {}
+
+  /** 重启后暂停区间是事件历史的派生缓存，主动重建验证可回放性。 */
+  async onModuleInit(): Promise<void> {
+    await this.leavesService.rebuildAllPeriods();
+  }
+}
